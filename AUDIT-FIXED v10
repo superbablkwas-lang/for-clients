@@ -1,0 +1,649 @@
+-- ============================================================================
+-- YBA AUTO FARM / SELL / LUCKY ARROW / SERVER HOP (AUDIT-FIXED v10)
+-- Executor: Delta (Android) | Game: Your Bizarre Adventure
+-- v10: принудительная продажа прямо перед хопом.
+-- ============================================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+repeat task.wait(0.1) until Players.LocalPlayer
+
+-- ============================================================================
+-- 0. RUN_ID + ОЧИСТКА
+-- ============================================================================
+local Env = getgenv and getgenv() or _G
+local RUN_ID = tostring(os.clock()) .. "_" .. tostring(math.random(1, 1e9))
+
+if type(Env.YBA_AutoFarm_Cleanup) == "function" then
+    pcall(Env.YBA_AutoFarm_Cleanup)
+    task.wait(0.6)
+end
+
+Env.YBA_AutoFarm_Running = false
+Env.YBA_AutoFarm_Enabled = false
+Env.YBA_CurrentRunId    = nil
+task.wait(0.1)
+
+Env.YBA_CurrentRunId    = RUN_ID
+Env.YBA_AutoFarm_Running = true
+Env.YBA_AutoFarm_Enabled = true
+
+local function isActive()
+    return Env.YBA_AutoFarm_Running == true
+       and Env.YBA_AutoFarm_Enabled == true
+       and Env.YBA_CurrentRunId == RUN_ID
+end
+
+-- ============================================================================
+-- 1. КОНФИГ
+-- ============================================================================
+local Config = {
+    KeepItems = {
+        ["Lucky Arrow"] = true,
+        ["Lucky Stone Mask"] = true,
+    },
+    MaxLuckyArrows = 9,
+    ActionDelay = 0.35,
+    HopEmptyGrace = 2,
+    HopCooldown = 180,
+    SellInterval = 15,
+    BuyInterval = 30,
+    RemoteCacheTTL = 5.0,
+    ContainerMissTTL = 3.0,
+    AutoSkipRateLimit = 1.0,
+    ErrorLogTTL = 5.0,
+    MaxCollectFails = 3,
+
+    EnableHop = true,          -- [V9-1]
+    HopSourcePath = "yba_autofarm.lua",
+    HopSellRetryInterval = 5,  -- [V10-1] rate-limit forced-sell в hop-блоке
+}
+
+local FSM = {
+    LastHop = -math.huge,
+    LastSell = 0,
+    LastBuy = 0,
+    LastHopSellAttempt = 0,    -- [V10-1] rate-limit forced-sell
+    Selling = false,
+    Buying = false,
+    LastItemSeen = os.clock(),
+    LastAutoSkip = 0,
+    LastLoopErr = 0,
+    HudBuilding = false,
+}
+
+-- ============================================================================
+-- 2. HUD
+-- ============================================================================
+local HUD, HUDLabel = nil, nil
+
+local function logStatus(text)
+    if not isActive() then return end
+    pcall(function()
+        if HUDLabel and HUDLabel.Parent then
+            HUDLabel.Text = "YBA | " .. tostring(text)
+        end
+    end)
+end
+
+local function buildHUD()
+    local pGui
+    for _ = 1, 30 do
+        pGui = LocalPlayer:FindFirstChild("PlayerGui")
+        if pGui then break end
+        task.wait(0.1)
+    end
+    if not pGui then
+        warn("[YBA] PlayerGui не появился за 3с — HUD не создан")
+        return false
+    end
+
+    local old = pGui:FindFirstChild("YBA_AutoFarm_HUD")
+    if old then old:Destroy() end
+
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "YBA_AutoFarm_HUD"
+    screen.ResetOnSpawn = false
+    screen.DisplayOrder = 999999
+    screen.Parent = pGui
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 320, 0, 32)
+    frame.Position = UDim2.new(0, 12, 0, 12)
+    frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+    frame.BorderSizePixel = 1
+    frame.BorderColor3 = Color3.fromRGB(0, 200, 120)
+    frame.Parent = screen
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -8, 1, -8)
+    label.Position = UDim2.new(0, 4, 0, 4)
+    label.BackgroundTransparency = 1
+    label.Text = "YBA | Инициализация..."
+    label.TextColor3 = Color3.fromRGB(0, 220, 140)
+    label.Font = Enum.Font.SourceSansBold
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    HUDLabel = label
+    HUD = screen
+    return true
+end
+
+local function ensureHudAsync()
+    if FSM.HudBuilding then return end
+    if HUDLabel and HUDLabel.Parent then return end
+    FSM.HudBuilding = true
+    task.spawn(function()
+        if isActive() then
+            buildHUD()
+        end
+        FSM.HudBuilding = false
+    end)
+end
+
+-- ============================================================================
+-- 3. ПОИСК РЕМОТОВ
+-- ============================================================================
+local CachedRemotes = nil
+local function findRemotesFolder()
+    if CachedRemotes and CachedRemotes.Parent then return CachedRemotes end
+    local candidates = {
+        ReplicatedStorage:FindFirstChild("Remotes"),
+        ReplicatedStorage:FindFirstChild("GameEvents"),
+        ReplicatedStorage:FindFirstChild("RemoteEvents"),
+    }
+    for _, folder in ipairs(candidates) do
+        if folder then
+            CachedRemotes = folder
+            return folder
+        end
+    end
+    return nil
+end
+
+local RemoteMissCache = {}
+local function getRemoteAny(names)
+    local folder = findRemotesFolder()
+    if not folder then
+        logStatus("Не найдена папка с ремоутами")
+        return nil
+    end
+    for _, name in ipairs(names) do
+        local rem = folder:FindFirstChild(name) or folder:FindFirstChild(name, true)
+        if rem then
+            RemoteMissCache[name] = nil
+            return rem
+        end
+    end
+    local now = os.clock()
+    for _, name in ipairs(names) do
+        local last = RemoteMissCache[name]
+        if not last or (now - last) > Config.RemoteCacheTTL then
+            RemoteMissCache[name] = now
+            logStatus("Ремот не найден: " .. name)
+            break
+        end
+    end
+    return nil
+end
+
+local function getSellRemote()
+    return getRemoteAny({"Sell_Item", "SellItem", "SellInventory", "Sell"})
+end
+local function getBuyRemote()
+    return getRemoteAny({"BuyItem", "Purchase", "Buy"})
+end
+
+-- ============================================================================
+-- 4. АВТО-ПРОПУСК
+-- ============================================================================
+local function autoSkipLoading()
+    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pGui then return end
+    for _, gui in ipairs(pGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Name ~= "YBA_AutoFarm_HUD" then
+            for _, obj in ipairs(gui:GetDescendants()) do
+                if obj:IsA("GuiButton") then
+                    local txt = string.lower(obj.Text or "")
+                    if string.find(txt, "play") or string.find(txt, "start") then
+                        if firesignal then
+                            pcall(firesignal, obj.Activated)
+                            pcall(firesignal, obj.MouseButton1Click)
+                        end
+                        task.wait(0.2)
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================================
+-- 5. КОНТЕЙНЕР
+-- ============================================================================
+local CachedContainer, ContainerMissTime = nil, 0
+
+local function getItemContainer()
+    if CachedContainer and CachedContainer.Parent then
+        return CachedContainer
+    end
+    CachedContainer = nil
+
+    local spawns = Workspace:FindFirstChild("Item_Spawns")
+    if spawns then
+        local items = spawns:FindFirstChild("Items")
+        if items then
+            CachedContainer = items
+            return items
+        end
+    end
+
+    if os.clock() - ContainerMissTime < Config.ContainerMissTTL then
+        return nil
+    end
+    ContainerMissTime = os.clock()
+
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if desc.Name == "Items" and (desc:IsA("Folder") or desc:IsA("Model")) then
+            local looksLikeItems = false
+            for _, child in ipairs(desc:GetChildren()) do
+                if child:IsA("Model") then
+                    local hasMesh, hasPrompt = false, false
+                    for _, sub in ipairs(child:GetDescendants()) do
+                        if sub:IsA("MeshPart") or sub:IsA("BasePart") then hasMesh = true end
+                        if sub:IsA("ProximityPrompt") then hasPrompt = true end
+                        if hasMesh and hasPrompt then break end
+                    end
+                    if hasMesh and hasPrompt then
+                        looksLikeItems = true
+                        break
+                    end
+                end
+            end
+            if looksLikeItems then
+                CachedContainer = desc
+                return desc
+            end
+        end
+    end
+    return nil
+end
+
+-- ============================================================================
+-- 6. СБОР
+-- ============================================================================
+local Collected = setmetatable({}, {__mode = "k"})
+local CollectFails = setmetatable({}, {__mode = "k"})
+
+local function getProximityPrompt(model)
+    if not model then return nil end
+    return model:FindFirstChildWhichIsA("ProximityPrompt", true)
+end
+
+local function shouldCollectItem(model)
+    if not model or not model:IsA("Model") then return false end
+    if Collected[model] then return false end
+    if (CollectFails[model] or 0) >= Config.MaxCollectFails then return false end
+    if not getProximityPrompt(model) then return false end
+    return true
+end
+
+local function collectItem(model)
+    if not model or not model.Parent or Collected[model] then return false end
+
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+
+    local part = model:FindFirstChildWhichIsA("MeshPart") or model:FindFirstChildWhichIsA("BasePart")
+    if not part then return false end
+
+    root.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
+    task.wait(0.5)
+
+    local prox = getProximityPrompt(model)
+    if not prox then return false end
+
+    local fired = false
+    pcall(function()
+        if fireproximityprompt then
+            fireproximityprompt(prox)
+            fired = true
+        elseif firesignal then
+            firesignal(prox.Triggered)
+            fired = true
+        end
+    end)
+    task.wait(0.3)
+
+    if fired then
+        Collected[model] = true
+        return true
+    end
+
+    CollectFails[model] = (CollectFails[model] or 0) + 1
+    return false
+end
+
+-- ============================================================================
+-- 7. ПРОДАЖА
+-- ============================================================================
+local function tryInvoke(remote, ...)
+    if not remote then return false end
+    local args = {...}
+    if remote:IsA("RemoteFunction") then
+        return (pcall(function() return remote:InvokeServer(unpack(args)) end))
+    elseif remote:IsA("RemoteEvent") then
+        return (pcall(function() remote:FireServer(unpack(args)) end))
+    end
+    return (pcall(function() remote:InvokeServer(unpack(args)) end))
+end
+
+local function sellAllSellable()
+    if FSM.Selling then return end
+    FSM.Selling = true
+
+    local ok, err = pcall(function()
+        local sellRemote = getSellRemote()
+        if not sellRemote then return end
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        if not backpack then return end
+
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if not isActive() then break end
+            if tool:IsA("Tool") and not Config.KeepItems[tool.Name] then
+                if not tryInvoke(sellRemote, tool) then
+                    tryInvoke(sellRemote, tool.Name)
+                end
+                task.wait(Config.ActionDelay)
+            end
+        end
+    end)
+
+    FSM.Selling = false
+    if not ok then logStatus("Sell err: " .. tostring(err)) end
+end
+
+-- ============================================================================
+-- 8. ПОКУПКА
+-- ============================================================================
+local function countLuckyArrows()
+    local n = 0
+    local bp = LocalPlayer:FindFirstChild("Backpack")
+    if bp then
+        for _, it in ipairs(bp:GetChildren()) do
+            if it.Name == "Lucky Arrow" then n = n + 1 end
+        end
+    end
+    local ch = LocalPlayer.Character
+    if ch then
+        for _, it in ipairs(ch:GetChildren()) do
+            if it.Name == "Lucky Arrow" then n = n + 1 end
+        end
+    end
+    return n
+end
+
+local function buyLuckyArrow()
+    if FSM.Buying then return end
+    local before = countLuckyArrows()
+    if before >= Config.MaxLuckyArrows then return end
+
+    FSM.Buying = true
+    local ok, err = pcall(function()
+        local buyRemote = getBuyRemote()
+        if not buyRemote then return end
+        local variants = {"Lucky Arrow", "LuckyArrow", "Lucky_Arrow"}
+        for _, arg in ipairs(variants) do
+            if not isActive() then break end
+            tryInvoke(buyRemote, arg)
+            task.wait(0.4)
+            if countLuckyArrows() > before then return end
+        end
+    end)
+    FSM.Buying = false
+    if not ok then logStatus("Buy err: " .. tostring(err)) end
+end
+
+-- ============================================================================
+-- [V10-1] Проверка: есть ли в Backpack вещи, которые можно продать
+-- (исключая KeepItems — Lucky Arrow / Lucky Stone Mask)
+-- ============================================================================
+local function hasSellableItemsInBackpack()
+    local bp = LocalPlayer:FindFirstChild("Backpack")
+    if not bp then return false end
+    for _, tool in ipairs(bp:GetChildren()) do
+        if tool:IsA("Tool") and not Config.KeepItems[tool.Name] then
+            return true
+        end
+    end
+    return false
+end
+
+-- ============================================================================
+-- 9. HTTP + SERVER HOP
+-- ============================================================================
+local function httpGet(url)
+    if type(HttpGet) == "function" then
+        local ok, res = pcall(HttpGet, url)
+        if ok and type(res) == "string" and #res > 0 then return res end
+    end
+    if typeof(request) == "function" then
+        local ok, res = pcall(request, {Url = url, Method = "GET"})
+        if ok and res and res.Success and res.Body then return res.Body end
+    end
+    if syn and type(syn.request) == "function" then
+        local ok, res = pcall(syn.request, {Url = url, Method = "GET"})
+        if ok and res and res.Success and res.Body then return res.Body end
+    end
+    if type(game.HttpGet) == "function" then
+        local ok, res = pcall(function() return game:HttpGet(url) end)
+        if ok and type(res) == "string" and #res > 0 then return res end
+    end
+    return nil
+end
+
+local function armAutoRestart()
+    if type(queue_on_teleport) ~= "function" then return false end
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return false end
+    local queued = false
+    pcall(function()
+        if isfile(Config.HopSourcePath) then
+            local src = readfile(Config.HopSourcePath)
+            if type(src) == "string" and #src > 100 then
+                queue_on_teleport(src)
+                queued = true
+            end
+        end
+    end)
+    return queued
+end
+
+local function serverHop()
+    if not Config.EnableHop then
+        logStatus("Server Hop выключен (EnableHop=false)")
+        return
+    end
+    if os.clock() - FSM.LastHop < Config.HopCooldown then
+        logStatus(string.format("Cooldown hop: %ds", math.floor(Config.HopCooldown - (os.clock() - FSM.LastHop))))
+        return
+    end
+
+    logStatus("Server Hop...")
+    local url = string.format(
+        "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100",
+        game.PlaceId
+    )
+    local body = httpGet(url)
+    if not body then
+        logStatus("HTTP недоступен")
+        return
+    end
+    local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if not ok or not data or not data.data then
+        logStatus("Не удалось распарсить список серверов")
+        return
+    end
+    for _, srv in ipairs(data.data) do
+        if srv.id ~= game.JobId and (tonumber(srv.playing) or 0) < (tonumber(srv.maxPlayers) or 0) then
+            FSM.LastHop = os.clock()
+
+            local canRestart = armAutoRestart()
+            if not canRestart then
+                logStatus("Hop без авто-рестарта — перезапусти скрипт вручную")
+                task.wait(1.5)
+                if not isActive() then
+                    warn("[YBA] Hop отменён — скрипт остановлен")
+                    return
+                end
+            end
+
+            if not isActive() then
+                warn("[YBA] Hop отменён — скрипт остановлен")
+                return
+            end
+
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, srv.id, LocalPlayer)
+            end)
+            return
+        end
+    end
+    logStatus("Свободных серверов не найдено")
+end
+
+-- ============================================================================
+-- 10. ГЛАВНЫЙ ЦИКЛ
+-- ============================================================================
+local function hasCollectibleInContainer(container)
+    if not container then return false end
+    for _, m in ipairs(container:GetChildren()) do
+        if shouldCollectItem(m) then return true end
+    end
+    return false
+end
+
+local function mainLoop()
+    while isActive() do
+        task.wait(0.1)
+        if not isActive() then break end
+
+        local ok, err = pcall(function()
+            if os.clock() - FSM.LastAutoSkip > Config.AutoSkipRateLimit then
+                FSM.LastAutoSkip = os.clock()
+                autoSkipLoading()
+            end
+
+            if not HUDLabel or not HUDLabel.Parent then
+                ensureHudAsync()
+            end
+
+            local container = getItemContainer()
+
+            if container then
+                for _, model in ipairs(container:GetChildren()) do
+                    if not isActive() then break end
+                    if shouldCollectItem(model) then
+                        logStatus("Подбираем: " .. model.Name)
+                        collectItem(model)
+                        task.wait(Config.ActionDelay)
+                    end
+                end
+            end
+
+            local hasCollectible = hasCollectibleInContainer(container)
+            if hasCollectible then
+                FSM.LastItemSeen = os.clock()
+            end
+
+            if os.clock() - FSM.LastSell > Config.SellInterval then
+                FSM.LastSell = os.clock()
+                task.spawn(function() sellAllSellable() end)
+            end
+
+            if os.clock() - FSM.LastBuy > Config.BuyInterval then
+                FSM.LastBuy = os.clock()
+                task.spawn(function() buyLuckyArrow() end)
+            end
+
+            -- [V10-2] Hop: только после сбора И продажи
+            if Config.EnableHop then
+                if not hasCollectible and (os.clock() - FSM.LastItemSeen > Config.HopEmptyGrace) then
+
+                    -- Принудительная продажа перед хопом (rate-limited, чтобы не спамить)
+                    if hasSellableItemsInBackpack() and not FSM.Selling
+                       and (os.clock() - FSM.LastHopSellAttempt > Config.HopSellRetryInterval) then
+                        FSM.LastHopSellAttempt = os.clock()
+                        logStatus("Продажа перед хопом...")
+                        sellAllSellable()          -- синхронный вызов, скрипт подождёт
+                        FSM.LastSell = os.clock()  -- сбросить таймер регулярной продажи
+                    end
+
+                    -- Хопаем ТОЛЬКО если бэкпак пуст и продажа не идёт прямо сейчас
+                    if not hasSellableItemsInBackpack() and not FSM.Selling then
+                        serverHop()
+                        FSM.LastItemSeen = os.clock()
+                    end
+                end
+            end
+        end)
+
+        if not ok then
+            local now = os.clock()
+            if now - FSM.LastLoopErr > Config.ErrorLogTTL then
+                FSM.LastLoopErr = now
+                logStatus("Loop err: " .. tostring(err))
+            end
+        end
+    end
+    logStatus("Цикл завершён")
+end
+
+-- ============================================================================
+-- 11. ЗАПУСК
+-- ============================================================================
+buildHUD()
+logStatus("Запуск " .. RUN_ID:sub(1, 12))
+
+local IdledConn = nil
+local function connectIdled()
+    if not isActive() then return end
+    if IdledConn then pcall(function() IdledConn:Disconnect() end) end
+    IdledConn = LocalPlayer.Idled:Connect(function()
+        if not isActive() then return end
+        pcall(function()
+            local vu = game:GetService("VirtualUser")
+            vu:CaptureController()
+            vu:ClickButton2(Vector2.new())
+        end)
+    end)
+end
+connectIdled()
+
+task.spawn(function()
+    task.wait(2)
+    if not isActive() then return end
+    mainLoop()
+end)
+
+Env.YBA_AutoFarm_Cleanup = function()
+    Env.YBA_AutoFarm_Running = false
+    Env.YBA_AutoFarm_Enabled = false
+    Env.YBA_CurrentRunId = nil
+    if IdledConn then pcall(function() IdledConn:Disconnect() end); IdledConn = nil end
+    if HUD then pcall(function() HUD:Destroy() end) end
+    HUD, HUDLabel = nil, nil
+    RemoteMissCache = {}
+    Collected = setmetatable({}, {__mode = "k"})
+    CollectFails = setmetatable({}, {__mode = "k"})
+    CachedContainer = nil
+    ContainerMissTime = 0
+    CachedRemotes = nil
+    FSM.HudBuilding = false
+end

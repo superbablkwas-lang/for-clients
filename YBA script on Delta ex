@@ -1,0 +1,853 @@
+--[[
+    ============================================================================
+    ИНСТРУКЦИЯ ПО ЗАПУСКУ (DELTA EXECUTOR ANDROID):
+    1. Скопируйте весь этот код от начала до конца.
+    2. Вставьте в Delta Executor и нажмите Execute (или поместите в папку autoexec).
+    3. Скрипт полностью автономен: сам сохраняет свой исходный код в 
+       getgenv().YBA_ScriptSource и перезапускается через queue_on_teleport 
+       при переходе в промежуточный плейс (1649559) и обратно в YBA (2809202155).
+    ============================================================================
+]]
+
+local env = getgenv and getgenv() or _G
+
+-- Сохраняем исходный код скрипта в глобальную переменную для queue_on_teleport
+env.YBA_ScriptSource = [===[
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local env = getgenv and getgenv() or _G
+
+-- // ГЛОБАЛЬНАЯ КОНФИГУРАЦИЯ //
+env.YBA_Config = env.YBA_Config or {
+    YBA_PlaceId = 2809202155,          -- Основной PlaceId Your Bizarre Adventure
+    GameIDtoHopTo = 1649559,           -- Промежуточный плейс для обхода ограничений Server Hop в Delta
+    ReturnDelay = 4.0,                 -- Задержка перед возвратом из промежуточного плейса (сек)
+    ScanInterval = 0.35,               -- Задержка при телепортации к предмету (защита CPU на Android)
+    TeleportOffset = Vector3.new(0, 2.5, 0), -- Смещение над предметом
+    MaxLuckyArrows = 9,                -- Лимит Lucky Arrow в инвентаре (9 шт.)
+    LuckyArrowPrice = 75000,           -- Стоимость Lucky Arrow в магазине ($75,000)
+    
+    -- Предметы, которые нужно собирать, но КАТЕГОРИЧЕСКИ НЕЛЬЗЯ продавать
+    KeepItems = {
+        ["Lucky Arrow"] = true,
+        ["Lucky Stone Mask"] = true,
+        ["Heart of the Saint's Corpse"] = true,
+        ["Pelvis of the Saint's Corpse"] = true,
+        ["Left Arm of the Saint's Corpse"] = true,
+        ["Requiem Arrow"] = true,
+        ["Green Baby"] = true
+    },
+
+    -- Предметы для сбора и последующей продажи торговцу (Merchant / ShiftPlox)
+    SellableItems = {
+        "Rokakaka",
+        "Mysterious Arrow",
+        "Pure Rokakaka",
+        "Stone Mask",
+        "Gold Coin",
+        "Ancient Scroll",
+        "Quinton's Glove",
+        "Caesar's Headband",
+        "Clackers",
+        "Steel Ball",
+        "Diamond",
+        "Dio's Diary",
+        "Rib Cage of The Saint's Corpse",
+        "Zeppeli's Hat"
+    }
+}
+
+-- Счётчики сессии
+env.YBA_Stats = env.YBA_Stats or {
+    Collected = 0,
+    Sold = 0,
+    BoughtLucky = 0
+}
+
+-- // СЕРВИСЫ ROBLOX //
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local VirtualUser = game:GetService("VirtualUser")
+local GuiService = game:GetService("GuiService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+    task.wait(0.2)
+    LocalPlayer = Players.LocalPlayer
+end
+
+-- // ИСПРАВЛЕНИЕ 3: КОРРЕКТНАЯ ПЕРЕДАЧА ИСХОДНОГО КОДА В QUEUE_ON_TELEPORT //
+local function QueueSelfOnTeleport()
+    pcall(function()
+        local queueFunc = queue_on_teleport 
+            or (syn and syn.queue_on_teleport) 
+            or (fluxus and fluxus.queue_on_teleport) 
+            or (delta and delta.queue_on_teleport)
+            
+        if queueFunc and type(env.YBA_ScriptSource) == "string" and #env.YBA_ScriptSource > 0 then
+            local bootstrapPayload = string.format(
+                "local env = getgenv and getgenv() or _G\n" ..
+                "env.YBA_ScriptSource = [===[%s]===]\n" ..
+                "loadstring(env.YBA_ScriptSource)()",
+                env.YBA_ScriptSource
+            )
+            queueFunc(bootstrapPayload)
+        end
+    end)
+end
+
+-- // ПРОВЕРКА ПРОМЕЖУТОЧНОГО ПЛЕЙСА (1649559 -> ВОЗВРАТ В YBA 2809202155) //
+if game.PlaceId == env.YBA_Config.GameIDtoHopTo then
+    QueueSelfOnTeleport()
+    task.spawn(function()
+        task.wait(env.YBA_Config.ReturnDelay)
+        while true do
+            pcall(function()
+                TeleportService:Teleport(env.YBA_Config.YBA_PlaceId, LocalPlayer)
+            end)
+            task.wait(3.0)
+        end
+    end)
+    return
+end
+
+-- Анти-AFK
+LocalPlayer.Idled:Connect(function()
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end)
+
+-- // МИНИМАЛИСТИЧНЫЙ МОБИЛЬНЫЙ GUI (ВСЕ ОБРАЩЕНИЯ ОБЕРНУТЫ В PCALL) //
+local UI = {}
+do
+    pcall(function()
+        local parentContainer = (gethui and gethui()) or CoreGui or LocalPlayer:WaitForChild("PlayerGui", 10)
+        local oldGui = parentContainer:FindFirstChild("YBA_Delta_AutoFarm_GUI")
+        if oldGui then
+            oldGui:Destroy()
+        end
+
+        local ScreenGui = Instance.new("ScreenGui")
+        ScreenGui.Name = "YBA_Delta_AutoFarm_GUI"
+        ScreenGui.ResetOnSpawn = false
+        ScreenGui.IgnoreGuiInset = true
+        ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        ScreenGui.Parent = parentContainer
+
+        local MainFrame = Instance.new("Frame")
+        MainFrame.Name = "MainFrame"
+        MainFrame.Size = UDim2.new(0, 260, 0, 175)
+        MainFrame.Position = UDim2.new(0.02, 0, 0.12, 0)
+        MainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+        MainFrame.BorderSizePixel = 0
+        MainFrame.Active = true
+        MainFrame.Draggable = true
+        MainFrame.Parent = ScreenGui
+
+        local UICorner = Instance.new("UICorner")
+        UICorner.CornerRadius = UDim.new(0, 8)
+        UICorner.Parent = MainFrame
+
+        local UIStroke = Instance.new("UIStroke")
+        UIStroke.Color = Color3.fromRGB(45, 45, 60)
+        UIStroke.Thickness = 1
+        UIStroke.Parent = MainFrame
+
+        local TopBar = Instance.new("Frame")
+        TopBar.Size = UDim2.new(1, 0, 0, 28)
+        TopBar.BackgroundColor3 = Color3.fromRGB(26, 26, 36)
+        TopBar.BorderSizePixel = 0
+        TopBar.Parent = MainFrame
+
+        local TopCorner = Instance.new("UICorner")
+        TopCorner.CornerRadius = UDim.new(0, 8)
+        TopCorner.Parent = TopBar
+
+        local Dot = Instance.new("Frame")
+        Dot.Size = UDim2.new(0, 8, 0, 8)
+        Dot.Position = UDim2.new(0, 10, 0.5, -4)
+        Dot.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+        Dot.BorderSizePixel = 0
+        Dot.Parent = TopBar
+
+        local DotCorner = Instance.new("UICorner")
+        DotCorner.CornerRadius = UDim.new(1, 0)
+        DotCorner.Parent = Dot
+
+        local TitleLabel = Instance.new("TextLabel")
+        TitleLabel.Size = UDim2.new(1, -60, 1, 0)
+        TitleLabel.Position = UDim2.new(0, 24, 0, 0)
+        TitleLabel.BackgroundTransparency = 1
+        TitleLabel.Text = "YBA Auto Farm"
+        TitleLabel.TextColor3 = Color3.fromRGB(240, 240, 245)
+        TitleLabel.Font = Enum.Font.GothamBold
+        TitleLabel.TextSize = 13
+        TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+        TitleLabel.Parent = TopBar
+
+        local ToggleBtn = Instance.new("TextButton")
+        ToggleBtn.Size = UDim2.new(0, 24, 0, 24)
+        ToggleBtn.Position = UDim2.new(1, -26, 0, 2)
+        ToggleBtn.BackgroundTransparency = 1
+        ToggleBtn.Text = "–"
+        ToggleBtn.TextColor3 = Color3.fromRGB(180, 180, 195)
+        ToggleBtn.Font = Enum.Font.GothamBold
+        ToggleBtn.TextSize = 16
+        ToggleBtn.Parent = TopBar
+
+        local ContentFrame = Instance.new("Frame")
+        ContentFrame.Size = UDim2.new(1, -16, 1, -34)
+        ContentFrame.Position = UDim2.new(0, 8, 0, 32)
+        ContentFrame.BackgroundTransparency = 1
+        ContentFrame.Parent = MainFrame
+
+        local StatusLabel = Instance.new("TextLabel")
+        StatusLabel.Size = UDim2.new(1, 0, 0, 20)
+        StatusLabel.Position = UDim2.new(0, 0, 0, 0)
+        StatusLabel.BackgroundTransparency = 1
+        StatusLabel.Text = "Статус: Инициализация..."
+        StatusLabel.TextColor3 = Color3.fromRGB(88, 166, 255)
+        StatusLabel.Font = Enum.Font.GothamSemibold
+        StatusLabel.TextSize = 12
+        StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+        StatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        StatusLabel.Parent = ContentFrame
+
+        local StatsLabel = Instance.new("TextLabel")
+        StatsLabel.Size = UDim2.new(1, 0, 0, 36)
+        StatsLabel.Position = UDim2.new(0, 0, 0, 22)
+        StatsLabel.BackgroundTransparency = 1
+        StatsLabel.Text = "Собрано: 0 | Продано: 0\nКуплено Lucky Arrow: 0"
+        StatsLabel.TextColor3 = Color3.fromRGB(210, 210, 220)
+        StatsLabel.Font = Enum.Font.Gotham
+        StatsLabel.TextSize = 11
+        StatsLabel.TextXAlignment = Enum.TextXAlignment.Left
+        StatsLabel.TextYAlignment = Enum.TextYAlignment.Top
+        StatsLabel.Parent = ContentFrame
+
+        local LogBox = Instance.new("Frame")
+        LogBox.Size = UDim2.new(1, 0, 0, 76)
+        LogBox.Position = UDim2.new(0, 0, 0, 62)
+        LogBox.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
+        LogBox.BorderSizePixel = 0
+        LogBox.Parent = ContentFrame
+
+        local LogCorner = Instance.new("UICorner")
+        LogCorner.CornerRadius = UDim.new(0, 6)
+        LogCorner.Parent = LogBox
+
+        local LogLabel = Instance.new("TextLabel")
+        LogLabel.Size = UDim2.new(1, -8, 1, -8)
+        LogLabel.Position = UDim2.new(0, 4, 0, 4)
+        LogLabel.BackgroundTransparency = 1
+        LogLabel.Text = "[Система] Скрипт запущен."
+        LogLabel.TextColor3 = Color3.fromRGB(150, 155, 165)
+        LogLabel.Font = Enum.Font.Code
+        LogLabel.TextSize = 10
+        LogLabel.TextXAlignment = Enum.TextXAlignment.Left
+        LogLabel.TextYAlignment = Enum.TextYAlignment.Top
+        LogLabel.TextWrapped = true
+        LogLabel.Parent = LogBox
+
+        local isCollapsed = false
+        ToggleBtn.MouseButton1Click:Connect(function()
+            pcall(function()
+                isCollapsed = not isCollapsed
+                ContentFrame.Visible = not isCollapsed
+                if isCollapsed then
+                    MainFrame.Size = UDim2.new(0, 260, 0, 28)
+                    ToggleBtn.Text = "+"
+                else
+                    MainFrame.Size = UDim2.new(0, 260, 0, 175)
+                    ToggleBtn.Text = "–"
+                end
+            end)
+        end)
+
+        local logHistory = { "[Система] Скрипт запущен." }
+
+        function UI:SetStatus(text)
+            pcall(function()
+                StatusLabel.Text = "Статус: " .. tostring(text)
+            end)
+        end
+
+        function UI:UpdateStats()
+            pcall(function()
+                StatsLabel.Text = string.format(
+                    "Собрано: %d | Продано: %d\nКуплено Lucky Arrow: %d",
+                    env.YBA_Stats.Collected,
+                    env.YBA_Stats.Sold,
+                    env.YBA_Stats.BoughtLucky
+                )
+            end)
+        end
+
+        function UI:Log(msg)
+            pcall(function()
+                local timestamp = os.date("%H:%M:%S")
+                table.insert(logHistory, string.format("[%s] %s", timestamp, tostring(msg)))
+                while #logHistory > 4 do
+                    table.remove(logHistory, 1)
+                end
+                LogLabel.Text = table.concat(logHistory, "\n")
+            end)
+        end
+
+        UI:UpdateStats()
+    end)
+end
+
+-- // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ //
+
+-- Безопасная эмуляция клика по GUI-кнопке (все обращения внутри pcall)
+local function TriggerGuiButton(btn)
+    local triggered = false
+    pcall(function()
+        if not btn or not btn:IsA("GuiButton") then return end
+
+        if firesignal then
+            pcall(function()
+                firesignal(btn.MouseButton1Click)
+                firesignal(btn.Activated)
+                firesignal(btn.MouseButton1Down)
+                firesignal(btn.MouseButton1Up)
+                triggered = true
+            end)
+        end
+
+        if not triggered and getconnections then
+            pcall(function()
+                for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do
+                    conn:Fire()
+                    triggered = true
+                end
+                for _, conn in ipairs(getconnections(btn.Activated)) do
+                    conn:Fire()
+                    triggered = true
+                end
+            end)
+        end
+
+        if not triggered and VirtualInputManager then
+            pcall(function()
+                local pos = btn.AbsolutePosition
+                local size = btn.AbsoluteSize
+                local inset = GuiService:GetGuiInset()
+                local centerX = pos.X + (size.X / 2)
+                local centerY = pos.Y + (size.Y / 2) + inset.Y
+                VirtualInputManager:SendMouseButtonEvent(centerX, centerY, 0, true, game, 1)
+                task.wait(0.05)
+                VirtualInputManager:SendMouseButtonEvent(centerX, centerY, 0, false, game, 1)
+                triggered = true
+            end)
+        end
+    end)
+    return triggered
+end
+
+-- Вызов Character.RemoteEvent / RemoteFunction в YBA
+local function SendYBARemote(actionType, ...)
+    local args = { ... }
+    local success, result = false, nil
+
+    pcall(function()
+        local character = LocalPlayer.Character
+        if character then
+            if actionType == "Event" and character:FindFirstChild("RemoteEvent") then
+                character.RemoteEvent:FireServer(unpack(args))
+                success = true
+            elseif actionType == "Function" and character:FindFirstChild("RemoteFunction") then
+                result = character.RemoteFunction:InvokeServer(unpack(args))
+                success = true
+            end
+        end
+    end)
+
+    return success, result
+end
+
+-- Подсчёт количества конкретного предмета в инвентаре (Backpack + Character)
+local function CountItemInInventory(itemName)
+    local count = 0
+    pcall(function()
+        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+        if backpack then
+            for _, tool in ipairs(backpack:GetChildren()) do
+                if tool:IsA("Tool") and tool.Name == itemName then
+                    count = count + 1
+                end
+            end
+        end
+        local char = LocalPlayer.Character
+        if char then
+            for _, tool in ipairs(char:GetChildren()) do
+                if tool:IsA("Tool") and tool.Name == itemName then
+                    count = count + 1
+                end
+            end
+        end
+    end)
+    return count
+end
+
+-- Получение текущего баланса денег игрока в YBA
+local function GetPlayerMoney()
+    local money = nil
+    pcall(function()
+        local stats = LocalPlayer:FindFirstChild("PlayerStats") or LocalPlayer:FindFirstChild("leaderstats")
+        if stats and stats:FindFirstChild("Money") then
+            money = tonumber(stats.Money.Value)
+        end
+    end)
+    return money
+end
+
+-- // ЭТАП 1 & 2: ПРОПУСК ЭКРАНА ЗАГРУЗКИ И НАЖАТИЕ PLAY //
+local function HandleLoadingAndPlay()
+    UI:SetStatus("Пропуск загрузки...")
+    UI:Log("Ожидание загрузки и кнопки Play...")
+
+    local maxWaitTime = 45
+    local startTime = os.clock()
+
+    while os.clock() - startTime < maxWaitTime do
+        local isReady = false
+
+        pcall(function()
+            local char = LocalPlayer.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+
+            local inMenu = false
+            if playerGui then
+                local loadingScreen = playerGui:FindFirstChild("LoadingScreen") or playerGui:FindFirstChild("LoadingScreen1")
+                if loadingScreen then
+                    inMenu = true
+                    for _, btn in ipairs(loadingScreen:GetDescendants()) do
+                        if btn:IsA("TextButton") and btn.Visible then
+                            TriggerGuiButton(btn)
+                        end
+                    end
+                end
+
+                for _, gui in ipairs(playerGui:GetDescendants()) do
+                    if gui:IsA("TextButton") and gui.Visible then
+                        local txt = string.lower(gui.Text or "")
+                        local name = string.lower(gui.Name or "")
+                        if string.find(txt, "skip") or string.find(name, "skip") then
+                            inMenu = true
+                            UI:SetStatus("Пропуск загрузки...")
+                            TriggerGuiButton(gui)
+                            UI:Log("Нажата кнопка Skip")
+                            task.wait(0.35)
+                        elseif txt == "play" or string.find(txt, "play") or name == "play" or string.find(name, "playbutton") then
+                            inMenu = true
+                            UI:SetStatus("Нажатие Play...")
+                            TriggerGuiButton(gui)
+                            UI:Log("Нажата кнопка Play")
+                            task.wait(0.45)
+                        end
+                    end
+                end
+            end
+
+            if not hrp or inMenu then
+                SendYBARemote("Event", "PressedPlay")
+            end
+
+            if hrp and not inMenu and (os.clock() - startTime > 4) then
+                UI:Log("Персонаж загружен на сервер.")
+                isReady = true
+            end
+        end)
+
+        if isReady then
+            break
+        end
+
+        task.wait(0.5)
+    end
+end
+
+-- // ЭТАП 3: АВТОМАТИЧЕСКИЙ СБОР ПРЕДМЕТОВ С ПОЛА (ДВОЙНОЙ МЕТОД ДЛЯ ANDROID) //
+local function CollectGroundItems()
+    UI:SetStatus("Сбор предметов...")
+    UI:Log("Сканирование спавнов предметов...")
+
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local hrp = char:WaitForChild("HumanoidRootPart", 10)
+    local hum = char:WaitForChild("Humanoid", 10)
+    if not hrp or not hum then
+        UI:Log("Ошибка: Персонаж не готов")
+        return
+    end
+
+    local targets = {}
+
+    pcall(function()
+        local itemContainer = workspace:FindFirstChild("Item_Spawns")
+        if itemContainer and itemContainer:FindFirstChild("Items") then
+            itemContainer = itemContainer.Items
+        end
+
+        local function ScanContainer(parent)
+            if not parent then return end
+            for _, obj in ipairs(parent:GetChildren()) do
+                pcall(function()
+                    local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+                    local clicker = obj:FindFirstChildWhichIsA("ClickDetector", true)
+                    local part = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart", true)
+
+                    if part and (prompt or clicker) then
+                        local mesh = obj:FindFirstChildWhichIsA("MeshPart", true) or part
+                        if mesh.Transparency < 1 then
+                            table.insert(targets, {
+                                Model = obj,
+                                Part = part,
+                                Prompt = prompt,
+                                Clicker = clicker
+                            })
+                        end
+                    end
+                end)
+            end
+        end
+
+        if itemContainer then
+            ScanContainer(itemContainer)
+        else
+            for _, desc in ipairs(workspace:GetDescendants()) do
+                if desc:IsA("ProximityPrompt") and desc.Parent and desc.Parent:IsA("BasePart") then
+                    local model = desc:FindFirstAncestorOfClass("Model")
+                    if model and not Players:GetPlayerFromCharacter(model) then
+                        table.insert(targets, {
+                            Model = model,
+                            Part = desc.Parent,
+                            Prompt = desc,
+                            Clicker = model:FindFirstChildWhichIsA("ClickDetector", true)
+                        })
+                    end
+                end
+            end
+        end
+    end)
+
+    UI:Log("Найдено предметов: " .. tostring(#targets))
+
+    for _, itemData in ipairs(targets) do
+        if not itemData.Model or not itemData.Model.Parent or not itemData.Part then
+            continue
+        end
+
+        char = LocalPlayer.Character
+        hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then break end
+
+        local beforeTotal = 0
+        pcall(function()
+            beforeTotal = #LocalPlayer.Backpack:GetChildren() + #char:GetChildren()
+        end)
+
+        pcall(function()
+            hrp.Velocity = Vector3.zero
+            hrp.CFrame = itemData.Part.CFrame + env.YBA_Config.TeleportOffset
+        end)
+
+        task.wait(env.YBA_Config.ScanInterval)
+
+        -- ИСПРАВЛЕНИЕ 4: Двойной метод сбора предметов (fireproximityprompt + InputHoldBegin/End)
+        pcall(function()
+            if itemData.Prompt and itemData.Prompt.Enabled then
+                if fireproximityprompt then
+                    fireproximityprompt(itemData.Prompt)
+                end
+                if itemData.Model.Parent then
+                    itemData.Prompt:InputHoldBegin()
+                    task.wait(itemData.Prompt.HoldDuration + 0.12)
+                    itemData.Prompt:InputHoldEnd()
+                end
+            end
+            if itemData.Clicker and fireclickdetector then
+                fireclickdetector(itemData.Clicker)
+            end
+        end)
+
+        task.wait(0.3)
+
+        local afterTotal = 0
+        pcall(function()
+            afterTotal = #LocalPlayer.Backpack:GetChildren() + #char:GetChildren()
+        end)
+
+        if afterTotal > beforeTotal then
+            env.YBA_Stats.Collected = env.YBA_Stats.Collected + (afterTotal - beforeTotal)
+            UI:UpdateStats()
+            UI:Log("Подобран предмет!")
+        end
+    end
+end
+
+-- // ЭТАП 4: АВТОМАТИЧЕСКАЯ ПРОДАЖА ПРЕДМЕТОВ (СТРОГАЯ ПРОВЕРКА tool.Parent == nil) //
+local function SellCollectedItems()
+    UI:SetStatus("Продажа...")
+    UI:Log("Продажа собранных предметов...")
+
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if not char or not hum or not backpack then return end
+
+    local sellableLookup = {}
+    for _, name in ipairs(env.YBA_Config.SellableItems) do
+        sellableLookup[name] = true
+    end
+
+    local toolsToProcess = {}
+    pcall(function()
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") then
+                table.insert(toolsToProcess, tool)
+            end
+        end
+        for _, tool in ipairs(char:GetChildren()) do
+            if tool:IsA("Tool") then
+                table.insert(toolsToProcess, tool)
+            end
+        end
+    end)
+
+    for _, tool in ipairs(toolsToProcess) do
+        if tool and tool.Parent then
+            local itemName = tool.Name
+            -- Никогда не продаем Lucky Arrow, Lucky Stone Mask и др. из KeepItems
+            if not env.YBA_Config.KeepItems[itemName] and sellableLookup[itemName] then
+                pcall(function()
+                    -- Экипируем предмет в руки персонажа
+                    if tool.Parent ~= char then
+                        hum:EquipTool(tool)
+                        task.wait(0.3)
+                    end
+
+                    -- Отправляем пакет продажи торговцу ShiftPlox (Merchant -> Option1 -> Dialogue5)
+                    if tool.Parent == char then
+                        local args = {
+                            [1] = "EndDialogue",
+                            [2] = {
+                                ["NPC"] = "Merchant",
+                                ["Option"] = "Option1",
+                                ["Dialogue"] = "Dialogue5"
+                            }
+                        }
+                        char.RemoteEvent:FireServer(unpack(args))
+                        task.wait(0.35)
+                    end
+                end)
+
+                -- ИСПРАВЛЕНИЕ 2: Строгая проверка `if tool.Parent == nil then`
+                -- Предмет должен полностью исчезнуть из игры после продажи
+                if tool.Parent == nil then
+                    env.YBA_Stats.Sold = env.YBA_Stats.Sold + 1
+                    UI:UpdateStats()
+                    UI:Log("Продано: " .. itemName)
+                else
+                    -- Если предмет остался в Character или Backpack — снимаем его с рук и НЕ увеличиваем счётчик
+                    pcall(function()
+                        hum:UnequipTools()
+                    end)
+                end
+            end
+        end
+    end
+
+    pcall(function()
+        hum:UnequipTools()
+    end)
+end
+
+-- // ЭТАП 5: ПОКУПКА LUCKY ARROW (ТОЛЬКО ЧЕРЕЗ ЭМУЛЯЦИЮ GUI PLAYERGUI -> HUD -> SHOP) //
+local function BuyLuckyArrows()
+    UI:SetStatus("Покупка Lucky Arrow...")
+
+    local currentLucky = CountItemInInventory("Lucky Arrow")
+    if currentLucky >= env.YBA_Config.MaxLuckyArrows then
+        UI:Log("Лимит Lucky Arrow (9/9) достигнут.")
+        return
+    end
+
+    -- ИСПРАВЛЕНИЕ 1: Полностью удалены несуществующие RemoteEvent.
+    -- Покупка осуществляется исключительно через навигацию и нажатие кнопок в PlayerGui -> HUD -> Shop.
+    local function TryBuyViaShopGUI()
+        local clickedPurchase = false
+
+        pcall(function()
+            local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+            if not pGui then return end
+
+            local hud = pGui:FindFirstChild("HUD") or pGui
+
+            -- 1. Открываем магазин через HUD -> Shop (если вкладка магазина еще не открыта)
+            for _, desc in ipairs(hud:GetDescendants()) do
+                pcall(function()
+                    if desc:IsA("GuiButton") and desc.Visible then
+                        local bName = string.lower(desc.Name or "")
+                        local bText = desc:IsA("TextButton") and string.lower(desc.Text or "") or ""
+                        if bName == "shop" or string.find(bName, "shopbutton") or bText == "shop" then
+                            TriggerGuiButton(desc)
+                            task.wait(0.25)
+                        end
+                    end
+                end)
+            end
+
+            -- 2. Ищем карточку Lucky Arrow в открытом магазине по тексту "Lucky Arrow", "75,000" или "75000"
+            for _, obj in ipairs(hud:GetDescendants()) do
+                pcall(function()
+                    if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+                        local txt = string.lower(obj.Text or "")
+                        local name = string.lower(obj.Name or "")
+
+                        if string.find(txt, "lucky arrow") or string.find(name, "lucky arrow") or string.find(txt, "75,000") or string.find(txt, "75000") then
+                            -- Нажимаем саму карточку, если это кнопка
+                            if obj:IsA("GuiButton") and obj.Visible then
+                                TriggerGuiButton(obj)
+                                clickedPurchase = true
+                                task.wait(0.2)
+                            end
+
+                            -- Ищем кнопки покупки внутри контейнера карточки (Parent и Parent.Parent)
+                            local container = obj.Parent
+                            if container then
+                                for _, child in ipairs(container:GetDescendants()) do
+                                    if child:IsA("GuiButton") and child.Visible then
+                                        TriggerGuiButton(child)
+                                        clickedPurchase = true
+                                        task.wait(0.2)
+                                    end
+                                end
+                                if container.Parent then
+                                    for _, subChild in ipairs(container.Parent:GetChildren()) do
+                                        if subChild:IsA("GuiButton") and subChild.Visible then
+                                            TriggerGuiButton(subChild)
+                                            clickedPurchase = true
+                                            task.wait(0.2)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end)
+            end
+
+            -- 3. Нажимаем кнопку подтверждения покупки (Buy / Purchase / Confirm)
+            for _, btn in ipairs(pGui:GetDescendants()) do
+                pcall(function()
+                    if btn:IsA("GuiButton") and btn.Visible then
+                        local bTxt = btn:IsA("TextButton") and string.lower(btn.Text or "") or ""
+                        local bName = string.lower(btn.Name or "")
+                        if bTxt == "buy" or bTxt == "purchase" or bTxt == "confirm" or string.find(bTxt, "75,000") or string.find(bTxt, "75000") or bName == "buy" or bName == "purchase" or bName == "confirm" then
+                            TriggerGuiButton(btn)
+                            clickedPurchase = true
+                            task.wait(0.2)
+                        end
+                    end
+                end)
+            end
+        end)
+
+        return clickedPurchase
+    end
+
+    -- Цикл покупки до достижения 9 штук в инвентаре
+    while currentLucky < env.YBA_Config.MaxLuckyArrows do
+        local money = GetPlayerMoney()
+        if not money or money < env.YBA_Config.LuckyArrowPrice then
+            UI:Log(string.format("Мало денег: $%s (< 75000). Стоп.", tostring(money or 0)))
+            break
+        end
+
+        local beforeLucky = currentLucky
+        local guiInteracted = TryBuyViaShopGUI()
+
+        task.wait(0.75)
+        currentLucky = CountItemInInventory("Lucky Arrow")
+
+        if currentLucky > beforeLucky then
+            local diff = currentLucky - beforeLucky
+            env.YBA_Stats.BoughtLucky = env.YBA_Stats.BoughtLucky + diff
+            UI:UpdateStats()
+            UI:Log("Куплена Lucky Arrow! (" .. tostring(currentLucky) .. "/9)")
+        else
+            if not guiInteracted then
+                UI:Log("Ошибка: не найден товар Lucky Arrow в GUI")
+            else
+                UI:Log("Ошибка: покупка Lucky Arrow не прошла")
+            end
+            break
+        end
+    end
+end
+
+-- // ЭТАП 6: АВТОМАТИЧЕСКИЙ SERVER HOP ЧЕРЕЗ ПРОМЕЖУТОЧНЫЙ ПЛЕЙС //
+local function PerformDeltaServerHop()
+    UI:SetStatus("Server Hop...")
+    UI:Log("Переход в плейс " .. tostring(env.YBA_Config.GameIDtoHopTo) .. "...")
+
+    -- Передаём сохранённый исходный код скрипта в queue_on_teleport перед прыжком
+    QueueSelfOnTeleport()
+
+    while true do
+        local ok = pcall(function()
+            TeleportService:Teleport(env.YBA_Config.GameIDtoHopTo, LocalPlayer)
+        end)
+        if not ok then
+            UI:Log("Повтор телепорта через 3с...")
+        end
+        task.wait(3.5)
+    end
+end
+
+-- // ЭТАП 7: ГЛАВНЫЙ БЕСКОНЕЧНЫЙ ЦИКЛ //
+task.spawn(function()
+    while true do
+        local cycleOk, cycleErr = pcall(function()
+            -- 1 & 2. Пропуск загрузки и нажатие Play
+            HandleLoadingAndPlay()
+            task.wait(1.0)
+
+            -- 3. Сбор всех предметов с пола
+            CollectGroundItems()
+            task.wait(0.8)
+
+            -- 4. Продажа всех собранных предметов (кроме Lucky Arrow и KeepItems)
+            SellCollectedItems()
+            task.wait(0.8)
+
+            -- 5. Покупка Lucky Arrow через GUI до 9 штук
+            BuyLuckyArrows()
+            task.wait(1.0)
+
+            -- 6. Server Hop через промежуточный плейс
+            PerformDeltaServerHop()
+        end)
+
+        if not cycleOk then
+            UI:Log("Сбой цикла: " .. tostring(cycleErr))
+            task.wait(2.0)
+            PerformDeltaServerHop()
+        end
+
+        task.wait(1.5)
+    end
+end)
+]===]
+
+-- Запускаем скрипт из сохранённой переменной
+loadstring(env.YBA_ScriptSource)()
